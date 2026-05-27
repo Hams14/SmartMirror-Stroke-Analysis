@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════════════╗
+║     STROKE ASYMMETRY MONITOR v4 — LCD Edition                       ║
+║     RPi 3B+  |  Rev 1.3 Cam  |  16×2 I2C LCD (PCF8574 backpack)   ║
+║                                                                      ║
+║  Setup (run once):                                                   ║
+║    sudo apt install python3-smbus i2c-tools -y                      ║
+║    pip install RPLCD smbus2                                          ║
+║    sudo raspi-config → Interface Options → I2C → Enable             ║
+║                                                                      ║
+║  Verify wiring:                                                      ║
+║    i2cdetect -y 1        # should show 0x27 or 0x3F in the grid     ║
+╚══════════════════════════════════════════════════════════════════════╝
+"""
+
+import cv2
+import numpy as np
+import subprocess
+import time
+import datetime
+import smbus2
+from RPLCD.i2c import CharLCD
+
+# ══════════════════════════════════════════════════════════════════════
+#  CASCADE PATHS
+# ══════════════════════════════════════════════════════════════════════
+FACE_CASCADE_PATH  = '/usr/share/opencv4/haarcascades/haarcascade_frontalface_alt2.xml'
+MCS_MOUTH_PATH     = '/usr/share/opencv4/haarcascades/haarcascade_mcs_mouth.xml'
+SMILE_CASCADE_PATH = '/usr/share/opencv4/haarcascades/haarcascade_smile.xml'
+EYE_CASCADE_PATH   = '/usr/share/opencv4/haarcascades/haarcascade_eye.xml'
+EYEGL_CASCADE_PATH = '/usr/share/opencv4/haarcascades/haarcascade_eye_tree_eyeglasses.xml'
+
+# ══════════════════════════════════════════════════════════════════════
+#  TUNING CONSTANTS
+# ══════════════════════════════════════════════════════════════════════
+LOG_INTERVAL         = 5
+ALERT_THRESHOLD      = 35
+ALARM_STREAK         = 3
+MOUTH_WEIGHT         = 0.65
+EYE_WEIGHT           = 0.35
+SCALE_FACTOR         = 2.0
+EMA_ALPHA            = 0.40
+BRIGHTNESS_MIN       = 35
+BRIGHTNESS_MAX       = 220
+ALARM_BLINK_INTERVAL = 1.0
+
+# ══════════════════════════════════════════════════════════════════════
+#  LOAD CASCADES
+# ══════════════════════════════════════════════════════════════════════
+face_cascade  = cv2.CascadeClassifier(FACE_CASCADE_PATH)
+eye_cascade   = cv2.CascadeClassifier(EYE_CASCADE_PATH)
+eyegl_cascade = cv2.CascadeClassifier(EYEGL_CASCADE_PATH)
+
+mouth_cascade = cv2.CascadeClassifier(MCS_MOUTH_PATH)
+if mouth_cascade.empty():
+    mouth_cascade = cv2.CascadeClassifier(SMILE_CASCADE_PATH)
+    MOUTH_CASCADE_LABEL = "smile (fallback)"
+else:
+    MOUTH_CASCADE_LABEL = "mcs_mouth"
+
+if face_cascade.empty():
+    raise RuntimeError(f"Cannot load face cascade: {FACE_CASCADE_PATH}")
+if mouth_cascade.empty():
+    raise RuntimeError("Cannot load any mouth cascade. Check your OpenCV install.")
+
+# ══════════════════════════════════════════════════════════════════════
+#  CLAHE  (created once — not per frame)
+# ══════════════════════════════════════════════════════════════════════
+_clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+# ══════════════════════════════════════════════════════════════════════
+#  STATE
+# ══════════════════════════════════════════════════════════════════════
+ema_risk     = None
+alert_streak = 0
+no_face_run  = 0
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  LCD HELPERS
+# ══════════════════════════════════════════════════════════════════════
+
+def scan_i2c(port: int = 1) -> list:
+    bus   = smbus2.SMBus(port)
+    found = []
+    for addr in list(range(0x20, 0x28)) + list(range(0x38, 0x40)):
+        try:
+            bus.read_byte(addr)
+            found.append(addr)
+        except OSError:
+            pass
+    bus.close()
+    return found
+
+
+def init_lcd(address: int, port: int = 1) -> CharLCD:
+    lcd = CharLCD(
+        i2c_expander    = 'PCF8574',
+        address         = address,
+        port            = port,
+        cols            = 16,
+        rows            = 2,
+        dotsize         = 8,
+        charmap         = 'A02',
+        auto_linebreaks = False,
+    )
+    lcd.backlight_enabled = True
+    return lcd
+
+
+def _pad(text: str) -> str:
+    """Truncate or right-pad to exactly 16 characters."""
+    return text[:16].ljust(16)
+
+
+def lcd_write(lcd: CharLCD, row0: str, row1: str) -> None:
+    try:
+        lcd.cursor_pos = (0, 0)
+        lcd.write_string(_pad(row0))
+        lcd.cursor_pos = (1, 0)
+        lcd.write_string(_pad(row1))
+    except Exception as e:
+        print(f"[LCD] Write error: {e}")
+
+
+def _risk_prefix(risk_val: int) -> str:
+    """
+    Build an 8-character risk prefix for row 1.
+
+    Format: 'Risk:45%'
+    The EMA-smoothed composite risk (0-99) is shown here so
+    the clinician sees the current risk level on every screen
+    state instead of the time.
+
+    Examples:
+      risk_val=7  → 'Risk:07%'
+      risk_val=45 → 'Risk:45%'
+      risk_val=99 → 'Risk:99%'
+    """
+    clamped = min(99, max(0, int(risk_val)))
+    return f"Risk:{clamped:02d}%"
+
+
+def build_data_row(mouth_risk, eye_risk, streak: int) -> str:
+    """
+    Build the 16-char second row.
+    Format: 'M:45 E:32 Stk:3 '
+    """
+    m_str = f"M:{min(99, mouth_risk):02d}" if mouth_risk is not None else "M:--"
+    e_str = f"E:{min(99, eye_risk):02d}"   if eye_risk   is not None else "E:--"
+    s_str = f"Stk:{min(9, streak)}+" if streak > 9 else f"Stk:{streak} "
+    return f"{m_str} {e_str} {s_str}"
+
+
+def show_startup(lcd: CharLCD) -> None:
+    lcd_write(lcd, "Stroke Monitor  ", " Initializing...")
+
+
+def show_normal(lcd: CharLCD, risk_val: int, mouth_risk, eye_risk) -> None:
+    # Row 1: 'Risk:45% NORMAL '   (8 + 1 + 6 + 1 = 16 chars)
+    lcd.backlight_enabled = True
+    lcd_write(lcd,
+              f"{_risk_prefix(risk_val)} NORMAL ",
+              build_data_row(mouth_risk, eye_risk, alert_streak))
+
+
+def show_warning(lcd: CharLCD, risk_val: int, mouth_risk, eye_risk) -> None:
+    # Row 1: 'Risk:62%WARNING!'   (8 + 8 = 16 chars)
+    lcd.backlight_enabled = True
+    lcd_write(lcd,
+              f"{_risk_prefix(risk_val)}WARNING!",
+              build_data_row(mouth_risk, eye_risk, alert_streak))
+
+
+def show_alarm(lcd: CharLCD, risk_val: int, mouth_risk, eye_risk,
+               blink_phase: bool) -> None:
+    """
+    Alternates every ALARM_BLINK_INTERVAL seconds:
+      Phase A: 'Risk:62% *ALARM*'   (8 + 1 + 7 = 16 chars)
+      Phase B: '!!! CHECK NOW !!'   (fixed 16-char banner)
+    Backlight also toggles for a visible physical flash.
+    """
+    lcd.backlight_enabled = blink_phase
+    row0 = (f"{_risk_prefix(risk_val)} *ALARM*" if blink_phase
+            else "!!! CHECK NOW !!")
+    lcd_write(lcd, row0,
+              build_data_row(mouth_risk, eye_risk, alert_streak))
+
+
+def show_no_face(lcd: CharLCD, no_face_count: int) -> None:
+    # No risk value available when there's no face — fill row 1 fully
+    lcd.backlight_enabled = True
+    row1 = ("Check camera!   " if no_face_count >= 5
+            else "Check position  ")
+    lcd_write(lcd, "  NO FACE DETCTD", row1)
+
+
+def show_no_features(lcd: CharLCD) -> None:
+    lcd.backlight_enabled = True
+    lcd_write(lcd, "FACE:NO FEATURES", "Poor lighting?  ")
+
+
+def show_too_dark(lcd: CharLCD) -> None:
+    lcd.backlight_enabled = True
+    lcd_write(lcd, "   TOO DARK     ", "Adjust lighting ")
+
+
+def show_too_bright(lcd: CharLCD) -> None:
+    lcd.backlight_enabled = True
+    lcd_write(lcd, "  OVEREXPOSED   ", "Reduce lighting ")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  FRAME PREPROCESSING
+# ══════════════════════════════════════════════════════════════════════
+
+def preprocess(frame: np.ndarray) -> tuple:
+    """
+    BGR → Gray → 3×3 Gaussian blur → CLAHE → 2× downscale.
+    Brightness measured before blur/CLAHE so the gate sees raw exposure.
+    """
+    gray        = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    mean_bright = float(np.mean(gray))
+    gray        = cv2.GaussianBlur(gray, (3, 3), 0)
+    gray        = _clahe.apply(gray)
+    gray_small  = cv2.resize(gray, (0, 0),
+                             fx=1.0 / SCALE_FACTOR,
+                             fy=1.0 / SCALE_FACTOR,
+                             interpolation=cv2.INTER_AREA)
+    return gray_small, mean_bright
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  ANALYSIS FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════
+
+def get_mouth_risk(mouth_roi: np.ndarray, face_w: int, face_h: int):
+    min_h = max(4, int(face_h * 0.08))
+    min_w = max(8, int(face_w * 0.25))
+    max_h = int(face_h * 0.34)
+    max_w = int(face_w * 0.92)
+    nn    = 16 if MOUTH_CASCADE_LABEL == "mcs_mouth" else 18
+
+    mouths = mouth_cascade.detectMultiScale(
+        mouth_roi, scaleFactor=1.07, minNeighbors=nn,
+        minSize=(min_w, min_h), maxSize=(max_w, max_h)
+    )
+    if len(mouths) == 0:
+        return None, False
+
+    mouths         = sorted(mouths, key=lambda m: m[2] * m[3], reverse=True)
+    sx, sy, sw, sh = mouths[0]
+    deviation      = abs((face_w // 2) - (sx + sw // 2)) / face_w
+    return min(100, int(deviation * 500)), True
+
+
+def _detect_eyes(roi: np.ndarray, face_w: int) -> np.ndarray:
+    min_eye = max(6, int(face_w * 0.10))
+    eyes    = eye_cascade.detectMultiScale(
+        roi, scaleFactor=1.1, minNeighbors=5,
+        minSize=(min_eye, min_eye)
+    )
+    if len(eyes) < 2 and not eyegl_cascade.empty():
+        eyes2 = eyegl_cascade.detectMultiScale(
+            roi, scaleFactor=1.1, minNeighbors=4,
+            minSize=(min_eye, min_eye)
+        )
+        if len(eyes2) > len(eyes):
+            return eyes2
+    return eyes
+
+
+def get_eye_risk(eye_roi: np.ndarray, face_w: int, face_h: int):
+    eyes = _detect_eyes(eye_roi, face_w)
+    if len(eyes) < 2:
+        return None, len(eyes)
+
+    top2 = sorted(eyes, key=lambda e: e[2] * e[3], reverse=True)[:2]
+    top2 = sorted(top2, key=lambda e: e[0])
+    (_, ey1, _, eh1), (_, ey2, _, eh2) = top2[0], top2[1]
+
+    cy1          = ey1 + eh1 // 2
+    cy2          = ey2 + eh2 // 2
+    centre_risk  = min(100, int((abs(cy1 - cy2) / face_h) * 350))
+
+    aperture_ratio = abs(eh1 - eh2) / max(eh1, eh2, 1)
+    ptosis_risk    = min(100, int(aperture_ratio * 220))
+
+    return min(100, int(centre_risk * 0.50 + ptosis_risk * 0.50)), 2
+
+
+def analyze_frame(gray_small: np.ndarray):
+    faces = face_cascade.detectMultiScale(
+        gray_small, scaleFactor=1.05, minNeighbors=6,
+        minSize=(65, 65), maxSize=(250, 250)
+    )
+    if len(faces) == 0:
+        return None, "No face detected.", {}, None, None
+
+    (x, y, w, h) = max(faces, key=lambda f: f[2] * f[3])
+
+    eye_y1    = y + int(h * 0.12)
+    eye_y2    = y + int(h * 0.52)
+    eye_roi   = gray_small[eye_y1:eye_y2, x:x+w]
+    mouth_roi = gray_small[y + int(h * 0.60):y+h, x:x+w]
+
+    mouth_risk, mouth_found = get_mouth_risk(mouth_roi, w, h)
+    eye_risk,   eye_count   = get_eye_risk(eye_roi,    w, h)
+
+    flags = {
+        'mouth_risk': mouth_risk, 'eye_risk': eye_risk,
+        'mouth_found': mouth_found, 'eyes_found': eye_count,
+    }
+
+    if mouth_risk is None and eye_risk is None:
+        return None, "Face visible, no features.", flags, None, None
+
+    if mouth_risk is None:
+        composite = int(eye_risk * 0.80)
+        detail    = f"Mouth:N/A  Eye:{eye_risk:3d} | Eyes:{eye_count}/2"
+    elif eye_risk is None:
+        composite = mouth_risk
+        detail    = f"Mouth:{mouth_risk:3d}  Eye:N/A"
+    else:
+        composite = int(mouth_risk * MOUTH_WEIGHT + eye_risk * EYE_WEIGHT)
+        detail    = f"Mouth:{mouth_risk:3d}  Eye:{eye_risk:3d} | Eyes:{eye_count}/2"
+
+    return composite, detail, flags, mouth_risk, eye_risk
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════
+
+def main():
+    global ema_risk, alert_streak, no_face_run
+
+    print("Scanning I2C bus for LCD...")
+    found_addrs = scan_i2c(port=1)
+
+    if not found_addrs:
+        raise RuntimeError(
+            "No I2C device found on bus 1.\n"
+            "  * Check wiring: SDA->GPIO2 (pin 3), SCL->GPIO3 (pin 5)\n"
+            "  * Enable I2C: sudo raspi-config -> Interface -> I2C\n"
+            "  * Verify: i2cdetect -y 1"
+        )
+
+    lcd_address = found_addrs[0]
+    print(f"  LCD found at {hex(lcd_address)}")
+
+    lcd = init_lcd(lcd_address)
+    show_startup(lcd)
+
+    print("=" * 66)
+    print("  STROKE ASYMMETRY MONITOR v4 — LCD Edition")
+    print(f"  LCD address   : {hex(lcd_address)}")
+    print(f"  Mouth cascade : {MOUTH_CASCADE_LABEL}")
+    print(f"  Alert         : risk >= {ALERT_THRESHOLD} | Alarm after {ALARM_STREAK} reads")
+    print("=" * 66)
+
+    cmd = [
+        'rpicam-vid', '-n', '--codec', 'mjpeg', '-t', '0',
+        '--width', '640', '--height', '480', '--framerate', '15',
+        '--inline', '-o', '-'
+    ]
+    pipe = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, bufsize=0)
+
+    byte_stream     = b''
+    last_log_time   = 0.0
+    last_blink_time = 0.0
+    blink_phase     = True
+    last_mouth      = None
+    last_eye        = None
+    last_risk_val   = 0     # last EMA risk value, kept for alarm blink rows
+
+    try:
+        while True:
+            byte_stream += pipe.stdout.read(2048)
+            a = byte_stream.find(b'\xff\xd8')
+            b = byte_stream.find(b'\xff\xd9')
+            if a == -1 or b == -1:
+                continue
+            jpg         = byte_stream[a:b+2]
+            byte_stream = byte_stream[b+2:]
+
+            now = time.time()
+            ts  = datetime.datetime.now().strftime("%H:%M")
+
+            # ── Alarm blink — runs independently of analysis gate ──────
+            if alert_streak >= ALARM_STREAK:
+                if now - last_blink_time >= ALARM_BLINK_INTERVAL:
+                    blink_phase     = not blink_phase
+                    last_blink_time = now
+                    show_alarm(lcd, last_risk_val, last_mouth, last_eye,
+                               blink_phase)
+                continue
+
+            # ── Analysis gate ──────────────────────────────────────────
+            if now - last_log_time < LOG_INTERVAL:
+                continue
+            last_log_time = now
+
+            frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8),
+                                 cv2.IMREAD_COLOR)
+            if frame is None:
+                continue
+
+            gray_small, brightness = preprocess(frame)
+
+            # ── Brightness gate ────────────────────────────────────────
+            if brightness < BRIGHTNESS_MIN:
+                print(f"[{ts}] TOO DARK  (mean={brightness:.0f})")
+                show_too_dark(lcd)
+                continue
+            if brightness > BRIGHTNESS_MAX:
+                print(f"[{ts}] TOO BRIGHT (mean={brightness:.0f})")
+                show_too_bright(lcd)
+                continue
+
+            # ── Analyse ────────────────────────────────────────────────
+            composite_risk, detail, flags, mouth_risk, eye_risk = \
+                analyze_frame(gray_small)
+
+            # ── Update state and LCD ───────────────────────────────────
+            if composite_risk is not None:
+                no_face_run = 0
+                last_mouth  = mouth_risk
+                last_eye    = eye_risk
+
+                # EMA smoothing
+                ema_risk = (composite_risk if ema_risk is None else
+                            EMA_ALPHA * composite_risk +
+                            (1.0 - EMA_ALPHA) * ema_risk)
+
+                last_risk_val = int(ema_risk)
+
+                # Soft streak (decay by 1 on clear read, not hard reset)
+                if composite_risk >= ALERT_THRESHOLD:
+                    alert_streak += 1
+                elif alert_streak > 0:
+                    alert_streak -= 1
+
+                status = ("ASYMMETRY" if composite_risk >= ALERT_THRESHOLD
+                          else "OK")
+                print(f"[{ts}] Raw:{composite_risk:3d} EMA:{ema_risk:5.1f} | "
+                      f"{detail} | {status}  Streak:{alert_streak}")
+
+                # LCD display
+                if alert_streak >= ALARM_STREAK:
+                    last_blink_time = 0     # force immediate first blink
+                elif composite_risk >= ALERT_THRESHOLD:
+                    show_warning(lcd, last_risk_val, mouth_risk, eye_risk)
+                else:
+                    show_normal(lcd, last_risk_val, mouth_risk, eye_risk)
+
+            elif "No face" in detail:
+                no_face_run += 1
+                # Do NOT reset streak — patient may have just moved briefly
+                print(f"[{ts}] No face ({no_face_run} consecutive)")
+                show_no_face(lcd, no_face_run)
+
+            else:
+                print(f"[{ts}] {detail}")
+                show_no_features(lcd)
+
+    except KeyboardInterrupt:
+        print("\nMonitor stopped.")
+    finally:
+        pipe.terminate()
+        try:
+            lcd_write(lcd, "Monitor stopped.", "Goodbye.        ")
+            time.sleep(1.5)
+            lcd.backlight_enabled = False
+            lcd.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,31 @@
+# Smart Mirror for Stroke Analysis
+
+A Raspberry Pi based smart mirror system for early stroke asymmetry detection using computer vision and facial feature analysis.
+
+## Features
+- Real-time face detection
+- Mouth asymmetry analysis
+- Eye asymmetry analysis
+- LCD display alerts
+- Risk score monitoring
+- Alarm system for stroke indication
+
+## Hardware Used
+- Raspberry Pi 3B+
+- Raspberry Pi Camera Rev 1.3
+- 16x2 I2C LCD Display
+- 16GB SD Card
+
+## Software Used
+- Python
+- OpenCV
+- NumPy
+- Haar Cascade Classifiers
+
+## How It Works
+The system captures facial images using the Raspberry Pi camera and analyzes facial asymmetry using Haar cascade algorithms. If asymmetry exceeds a threshold, warning and alarm messages are displayed on the LCD.
+
+## Installation
+
+```bash
+pip install -r requirements.txt
