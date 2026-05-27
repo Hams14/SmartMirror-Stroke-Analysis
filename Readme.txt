@@ -1,15 +1,13 @@
-# Smart Mirror for Stroke Analysis using Raspberry Pi
+Smart Mirror for Stroke Analysis using Raspberry Pi
 
-## Overview
+Overview
 The Smart Mirror for Stroke Analysis is a real-time healthcare monitoring system developed using Raspberry Pi, Computer Vision, and OpenCV. The system detects facial asymmetry such as mouth deviation and eye imbalance, which are common early indicators of stroke symptoms.  
 
 The project continuously captures facial images using a Raspberry Pi camera and analyzes facial features using Haar Cascade algorithms. Based on the detected asymmetry level, the system displays risk alerts and warning messages on a 16x2 I2C LCD display.
 
 This project aims to support early stroke detection and improve healthcare accessibility through low-cost embedded AI technology.
 
----
-
-# Features
+ Features
 - Real-time face detection
 - Mouth asymmetry detection
 - Eye asymmetry analysis
@@ -20,9 +18,8 @@ This project aims to support early stroke detection and improve healthcare acces
 - Lightweight Raspberry Pi implementation
 - Real-time risk monitoring using EMA smoothing
 
----
 
-# Hardware Components Used
+ Hardware Components Used
 
 | Component | Description |
 |---|---|
@@ -34,7 +31,7 @@ This project aims to support early stroke detection and improve healthcare acces
 
 ---
 
-# Software Requirements
+Software Requirements
 - Python 3
 - OpenCV
 - NumPy
@@ -43,7 +40,58 @@ This project aims to support early stroke detection and improve healthcare acces
 
 ---
 
-# Python Libraries Used
+Python Libraries Used
 
 ```bash
 pip install opencv-python numpy RPLCD smbus2
+
+
+LCD Output States                                         State	Description
+NORMAL	                                                  No major asymmetry detected
+WARNING	                                                  Mild asymmetry detected
+ALARM	                                                    Continuous high asymmetry detected
+NO FACE	                                                  Face not detected
+TOO DARK	                                                Insufficient lighting
+OVEREXPOSED	                                              Excessive brightness
+
+
+Future Enhancements
+
+Deep learning based stroke prediction
+Mobile application integration
+Cloud monitoring system
+Voice alert support
+Medical database integration
+Real-time doctor notification
+
+
+Applications
+
+Smart healthcare systems
+Elderly monitoring
+Stroke risk screening
+Home healthcare monitoring
+AI-based medical assistance
+
+
+Advantages
+
+Low-cost implementation
+Portable system
+Real-time monitoring
+Easy to use
+Fast alert generation
+Embedded AI solution
+
+Conclusion
+
+The Smart Mirror for Stroke Analysis provides an efficient and affordable solution for monitoring facial asymmetry related to stroke symptoms. By integrating Raspberry Pi, computer vision, and LCD alert systems, the project demonstrates the practical application of AI in healthcare monitoring and early disease detection.
+
+Author
+
+Hamsavarthini
+Computer Science and Engineering Student
+
+License
+
+This project is developed for educational and research purposes.
